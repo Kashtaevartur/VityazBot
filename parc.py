@@ -49,33 +49,32 @@ def log_user(update: Update):
 
 
 def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
+    for db_name in ["reservations.db", "reservations_read.db"]:
+        conn = sqlite3.connect(db_name, timeout=10)
+        cursor = conn.cursor()
 
-    conn.execute("PRAGMA journal_mode=WAL;")  # ✅ сюда
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company TEXT,
+            phone TEXT UNIQUE,
+            date TEXT
+        )
+        """)
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS reservations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company TEXT,
-        phone TEXT UNIQUE,
-        date TEXT
-    )
-    """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            last_seen TEXT
+        )
+        """)
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER UNIQUE,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        last_seen TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
 # --- состояния ---
 CHECK_PHONE = 1
@@ -115,11 +114,9 @@ def update_database():
 
     cutoff_date = datetime.now() - timedelta(days=4)
 
-    # ✅ отдельное подключение (ключевой фикс)
-    conn = get_db()
+    # 🔴 основная БД (запись)
+    conn = sqlite3.connect("reservations.db", timeout=10)
     cursor = conn.cursor()
-
-    # ✅ уменьшаем блокировки
 
     page = 1
     stop_parsing = False
@@ -159,22 +156,26 @@ def update_database():
 
                     batch.append(("Vityaz", phone, date_str))
 
-            # ✅ вставка пачкой (очень важно)
             if batch:
                 cursor.executemany("""
                     INSERT OR IGNORE INTO reservations (company, phone, date)
                     VALUES (?, ?, ?)
                 """, batch)
 
-                conn.commit()  # можно коммитить по страницам
+                conn.commit()
 
             page += 1
+
+        # ✅ ДЕЛАЕМ КОПИЮ БД (ключевой момент)
+        read_conn = sqlite3.connect("reservations_read.db")
+        conn.backup(read_conn)
+        read_conn.close()
 
     except Exception as e:
         print("Ошибка в update_database:", e)
 
     finally:
-        conn.close()  # ✅ обязательно закрываем
+        conn.close()
 
 
 # =========================
@@ -208,7 +209,7 @@ async def check_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(update_database)
 
     # ✅ новое подключение
-    conn = sqlite3.connect("reservations.db", timeout=10)
+    conn = sqlite3.connect("reservations_read.db", timeout=5)
     cursor = conn.cursor()
 
     cursor.execute("""
