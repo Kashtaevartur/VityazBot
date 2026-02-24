@@ -1,5 +1,6 @@
 import requests
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 from config import BOT_TOKEN, COOKIE, CSRF_TOKEN
 
@@ -10,15 +11,19 @@ from telegram.ext import (
 )
 
 # --- БД ---
-conn = sqlite3.connect("reservations.db", check_same_thread=False)
-cursor = conn.cursor()
-
+def get_db():
+    conn = sqlite3.connect("reservations.db", timeout=10)
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    return conn
 
 def log_user(update: Update):
     try:
         user = update.effective_user
         if not user:
             return
+
+        conn = get_db()
+        cursor = conn.cursor()
 
         cursor.execute("""
         INSERT INTO users (telegram_id, username, first_name, last_name, last_seen)
@@ -37,32 +42,40 @@ def log_user(update: Update):
         ))
 
         conn.commit()
+        conn.close()
 
     except Exception as e:
         print("Ошибка логирования пользователя:", e)
 
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS reservations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    company TEXT,
-    phone TEXT UNIQUE,
-    date TEXT
-)
-""")
+def init_db():
+    conn = get_db()
+    cursor = conn.cursor()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id INTEGER UNIQUE,
-    username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    last_seen TEXT
-)
-""")
+    conn.execute("PRAGMA journal_mode=WAL;")  # ✅ сюда
 
-conn.commit()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS reservations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company TEXT,
+        phone TEXT UNIQUE,
+        date TEXT
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER UNIQUE,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        last_seen TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
 
 # --- состояния ---
 CHECK_PHONE = 1
@@ -79,6 +92,10 @@ keyboard = ReplyKeyboardMarkup(
 # 🔄 ПАРСИНГ ФУНКЦИЯ
 # =========================
 def update_database():
+    import sqlite3
+    import requests
+    from datetime import datetime, timedelta
+
     url = "https://vityaz.salesdrive.me/contacts/"
 
     headers = {
@@ -98,52 +115,82 @@ def update_database():
 
     cutoff_date = datetime.now() - timedelta(days=4)
 
+    # ✅ отдельное подключение (ключевой фикс)
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # ✅ уменьшаем блокировки
+
     page = 1
     stop_parsing = False
 
-    while not stop_parsing:
-        params = base_params.copy()
-        params["page"] = page
+    try:
+        while not stop_parsing:
+            params = base_params.copy()
+            params["page"] = page
 
-        response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params)
 
-        if response.status_code != 200:
-            print("Ошибка API")
-            break
-
-        data = response.json()
-        contacts = data.get("data", [])
-
-        if not contacts:
-            break
-
-        for contact in contacts:
-            date_str = contact["createTime"]
-            contact_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-
-            if contact_date < cutoff_date:
-                stop_parsing = True
+            if response.status_code != 200:
+                print("Ошибка API:", response.status_code)
                 break
 
-            for phone in contact.get("phone", []):
-                phone = phone.strip()
+            data = response.json()
+            contacts = data.get("data", [])
 
-                if not phone.isdigit() or len(phone) < 10:
-                    continue
+            if not contacts:
+                break
 
-                cursor.execute("""
-                INSERT OR IGNORE INTO reservations (company, phone, date)
-                VALUES (?, ?, ?)
-                """, ("Vityaz", phone, date_str))
+            batch = []
 
-        page += 1
+            for contact in contacts:
+                date_str = contact["createTime"]
+                contact_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
 
-    conn.commit()
+                if contact_date < cutoff_date:
+                    stop_parsing = True
+                    break
+
+                for phone in contact.get("phone", []):
+                    phone = phone.strip()
+
+                    if not phone.isdigit() or len(phone) < 10:
+                        continue
+
+                    batch.append(("Vityaz", phone, date_str))
+
+            # ✅ вставка пачкой (очень важно)
+            if batch:
+                cursor.executemany("""
+                    INSERT OR IGNORE INTO reservations (company, phone, date)
+                    VALUES (?, ?, ?)
+                """, batch)
+
+                conn.commit()  # можно коммитить по страницам
+
+            page += 1
+
+    except Exception as e:
+        print("Ошибка в update_database:", e)
+
+    finally:
+        conn.close()  # ✅ обязательно закрываем
 
 
 # =========================
 # 🤖 БОТ
 # =========================
+def mask_phone(phone: str) -> str:
+    if not phone:
+        return "N/A"
+
+    phone = str(phone).strip()
+
+    if len(phone) <= 4:
+        return phone
+
+    visible_digits = 4
+    return "*" * (len(phone) - visible_digits) + phone[-visible_digits:]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_user(update)
@@ -151,36 +198,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- ПРОВЕРКА ---
-async def check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_user(update)
-    await update.message.reply_text("Введите фрагмент номера:")
-    return CHECK_PHONE
-
-
 async def check_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+
     digits = update.message.text.strip()
 
     await update.message.reply_text("⏳ Обновляю базу...")
-    update_database()
+    await asyncio.to_thread(update_database)
+
+    # ✅ новое подключение
+    conn = sqlite3.connect("reservations.db", timeout=10)
+    cursor = conn.cursor()
 
     cursor.execute("""
     SELECT company, phone, date 
     FROM reservations 
     WHERE phone LIKE ?
-    """, ('%' + digits,))
+    """, ('%' + digits + '%',))
 
     result = cursor.fetchone()
 
+    conn.close()  # ✅ обязательно закрываем
+
     if result:
         company, phone, date = result
+        masked = mask_phone(phone or "")
+
         await update.message.reply_text(
-            f"✅ Найдено:\nКомпания: {company}\nТелефон: {phone}\nДата: {date}"
+            f"✅ Найдено:\nКомпания: {company}\nТелефон: {masked}\nДата: {date}",
+            reply_markup=keyboard
         )
     else:
         await update.message.reply_text("❌ Бронь не найдена", reply_markup=keyboard)
 
     return ConversationHandler.END
-
 
 # --- ДОБАВЛЕНИЕ ---
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,12 +252,17 @@ async def add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = context.user_data["phone"]
     company = update.message.text.strip()
 
+    conn = get_db()
+    cursor = conn.cursor()
+
     cursor.execute("""
     INSERT OR IGNORE INTO reservations (company, phone, date)
     VALUES (?, ?, ?)
     """, (company, phone, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     conn.commit()
+    conn.close()
+
     log_user(update)
 
     await update.message.reply_text("✅ Бронь сохранена!", reply_markup=keyboard)
@@ -218,7 +275,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_user(update)
 
     if text == "Проверить бронь":
-        return await check_start(update, context)
+        await update.message.reply_text("Введите фрагмент номера:")
+        return CHECK_PHONE
 
     elif text == "Сделать бронь":
         return await add_start(update, context)
@@ -230,13 +288,13 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 conv_handler = ConversationHandler(
     entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons)],
     states={
-        CHECK_PHONE: [MessageHandler(filters.TEXT, check_phone)],
+        CHECK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_phone)],
         ADD_PHONE: [MessageHandler(filters.TEXT, add_phone)],
         ADD_COMPANY: [MessageHandler(filters.TEXT, add_company)],
     },
     fallbacks=[]
 )
-
+init_db()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(conv_handler)
 
