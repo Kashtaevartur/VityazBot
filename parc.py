@@ -200,38 +200,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ПРОВЕРКА ---
 async def check_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return ConversationHandler.END
+    try:
+        if not update.message or not update.message.text:
+            return ConversationHandler.END
 
-    digits = update.message.text.strip()
+        text = update.message.text.strip()
 
-    await update.message.reply_text("⏳ Обновляю базу...")
-    await asyncio.to_thread(update_database)
+        # ❗ защита от нажатия кнопок вместо номера
+        if text in ["Проверить бронь", "Сделать бронь"]:
+            await update.message.reply_text("⚠️ Введите фрагмент номера")
+            return CHECK_PHONE
 
-    # ✅ новое подключение
-    conn = sqlite3.connect("reservations_read.db", timeout=5)
-    cursor = conn.cursor()
+        digits = text
 
-    cursor.execute("""
-    SELECT company, phone, date 
-    FROM reservations 
-    WHERE phone LIKE ?
-    """, ('%' + digits + '%',))
+        await update.message.reply_text("⏳ Обновляю базу...")
 
-    result = cursor.fetchone()
+        # 🔥 НЕ БЛОКИРУЕМ EVENT LOOP
+        import asyncio
+        await asyncio.to_thread(update_database)
 
-    conn.close()  # ✅ обязательно закрываем
+        # ✅ читаем из read БД
+        conn = sqlite3.connect("reservations_read.db", timeout=5)
+        cursor = conn.cursor()
 
-    if result:
-        company, phone, date = result
-        masked = mask_phone(phone or "")
+        cursor.execute("""
+        SELECT company, phone, date 
+        FROM reservations 
+        WHERE phone LIKE ?
+        """, ('%' + digits + '%',))
 
-        await update.message.reply_text(
-            f"✅ Найдено:\nКомпания: {company}\nТелефон: {masked}\nДата: {date}",
-            reply_markup=keyboard
-        )
-    else:
-        await update.message.reply_text("❌ Бронь не найдена", reply_markup=keyboard)
+        result = cursor.fetchone()
+        conn.close()
+
+        if result:
+            company, phone, date = result
+            masked = mask_phone(phone or "")
+
+            await update.message.reply_text(
+                f"✅ Найдено:\nКомпания: {company}\nТелефон: {masked}\nДата: {date}",
+                reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Бронь не найдена",
+                reply_markup=keyboard
+            )
+
+    except Exception as e:
+        print("Ошибка в check_phone:", e)
+        await update.message.reply_text("⚠️ Ошибка при проверке")
+
+    finally:
+        # 🔓 снимаем блок ВСЕГДА
+        context.user_data.pop("busy", None)
 
     return ConversationHandler.END
 
@@ -250,23 +271,32 @@ async def add_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = context.user_data["phone"]
-    company = update.message.text.strip()
+    try:
+        phone = context.user_data["phone"]
+        company = update.message.text.strip()
 
-    conn = get_db()
-    cursor = conn.cursor()
+        conn = get_db()
+        cursor = conn.cursor()
 
-    cursor.execute("""
-    INSERT OR IGNORE INTO reservations (company, phone, date)
-    VALUES (?, ?, ?)
-    """, (company, phone, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        cursor.execute("""
+        INSERT OR IGNORE INTO reservations (company, phone, date)
+        VALUES (?, ?, ?)
+        """, (company, phone, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
-    log_user(update)
+        log_user(update)
 
-    await update.message.reply_text("✅ Бронь сохранена!", reply_markup=keyboard)
+        await update.message.reply_text(
+            "✅ Бронь сохранена!",
+            reply_markup=keyboard
+        )
+
+    finally:
+        # 🔓 снимаем блок даже если произошла ошибка
+        context.user_data["busy"] = False
+
     return ConversationHandler.END
 
 
@@ -275,28 +305,58 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     log_user(update)
 
+    # 🔒 если уже в процессе — стоп
+    if context.user_data.get("busy"):
+        await update.message.reply_text("⏳ Подожди, предыдущий запрос ещё выполняется")
+        return ConversationHandler.END
+
     if text == "Проверить бронь":
+        context.user_data["busy"] = True  # ✅ ставим ЗДЕСЬ
         await update.message.reply_text("Введите фрагмент номера:")
         return CHECK_PHONE
 
     elif text == "Сделать бронь":
+        context.user_data["busy"] = True  # ✅ и здесь
         return await add_start(update, context)
 
 
 # --- запуск ---
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+async def fallback_text(update, context):
+    await update.message.reply_text("👇Нажми на кнопку ниже 👇")
+
 conv_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons)],
+    entry_points=[
+        MessageHandler(
+            filters.Regex("^(Проверить бронь|Сделать бронь)$"),
+            handle_buttons
+        )
+    ],
     states={
-        CHECK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_phone)],
-        ADD_PHONE: [MessageHandler(filters.TEXT, add_phone)],
-        ADD_COMPANY: [MessageHandler(filters.TEXT, add_company)],
+        CHECK_PHONE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, check_phone)
+        ],
+        ADD_PHONE: [
+            MessageHandler(filters.TEXT, add_phone)
+        ],
+        ADD_COMPANY: [
+            MessageHandler(filters.TEXT, add_company)
+        ],
     },
-    fallbacks=[]
+    fallbacks=[
+        MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text)
+    ]
 )
+
 init_db()
+
 app.add_handler(CommandHandler("start", start))
 app.add_handler(conv_handler)
+
+# самый последний!
+app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text)
+)
 
 app.run_polling()
