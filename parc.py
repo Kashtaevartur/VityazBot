@@ -9,11 +9,38 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler
 )
 
-TOKEN = "ТВОЙ_ТОКЕН"
-
 # --- БД ---
 conn = sqlite3.connect("reservations.db", check_same_thread=False)
 cursor = conn.cursor()
+
+
+def log_user(update: Update):
+    try:
+        user = update.effective_user
+        if not user:
+            return
+
+        cursor.execute("""
+        INSERT INTO users (telegram_id, username, first_name, last_name, last_seen)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            last_seen=excluded.last_seen
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+        conn.commit()
+
+    except Exception as e:
+        print("Ошибка логирования пользователя:", e)
+
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reservations (
@@ -23,6 +50,19 @@ CREATE TABLE IF NOT EXISTS reservations (
     date TEXT
 )
 """)
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER UNIQUE,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    last_seen TEXT
+)
+""")
+
+conn.commit()
 
 # --- состояния ---
 CHECK_PHONE = 1
@@ -42,11 +82,11 @@ def update_database():
     url = "https://vityaz.salesdrive.me/contacts/"
 
     headers = {
-    "User-Agent": "Mozilla/5.0",
-    "Cookie": COOKIE,
-    "X-CSRF-Token": CSRF_TOKEN,
-    "Accept": "application/json"
-}
+        "User-Agent": "Mozilla/5.0",
+        "Cookie": COOKIE,
+        "X-CSRF-Token": CSRF_TOKEN,
+        "Accept": "application/json"
+    }
 
     base_params = {
         "formId": 1,
@@ -56,7 +96,7 @@ def update_database():
         "per-page": 100
     }
 
-    cutoff_date = datetime.now() - timedelta(days=20)
+    cutoff_date = datetime.now() - timedelta(days=4)
 
     page = 1
     stop_parsing = False
@@ -100,17 +140,22 @@ def update_database():
 
     conn.commit()
 
+
 # =========================
 # 🤖 БОТ
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_user(update)
     await update.message.reply_text("Выберите действие:", reply_markup=keyboard)
+
 
 # --- ПРОВЕРКА ---
 async def check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите последние 5 цифр номера:")
+    log_user(update)
+    await update.message.reply_text("Введите фрагмент номера:")
     return CHECK_PHONE
+
 
 async def check_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     digits = update.message.text.strip()
@@ -132,19 +177,24 @@ async def check_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Найдено:\nКомпания: {company}\nТелефон: {phone}\nДата: {date}"
         )
     else:
-        await update.message.reply_text("❌ Бронь не найдена")
+        await update.message.reply_text("❌ Бронь не найдена", reply_markup=keyboard)
 
     return ConversationHandler.END
 
+
 # --- ДОБАВЛЕНИЕ ---
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_user(update)
     await update.message.reply_text("Введите номер телефона:")
     return ADD_PHONE
 
+
 async def add_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_user(update)
     context.user_data["phone"] = update.message.text.strip()
     await update.message.reply_text("За кем закрепить бронь?")
     return ADD_COMPANY
+
 
 async def add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = context.user_data["phone"]
@@ -156,18 +206,23 @@ async def add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """, (company, phone, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     conn.commit()
+    log_user(update)
 
-    await update.message.reply_text("✅ Бронь сохранена!")
+    await update.message.reply_text("✅ Бронь сохранена!", reply_markup=keyboard)
     return ConversationHandler.END
+
 
 # --- кнопки ---
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    log_user(update)
 
     if text == "Проверить бронь":
         return await check_start(update, context)
+
     elif text == "Сделать бронь":
         return await add_start(update, context)
+
 
 # --- запуск ---
 app = ApplicationBuilder().token(BOT_TOKEN).build()
