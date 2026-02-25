@@ -10,6 +10,8 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler
 )
 
+ADMIN_CHAT_ID = -5239727089
+
 # --- БД ---
 def get_db():
     conn = sqlite3.connect("reservations.db", timeout=10)
@@ -112,7 +114,7 @@ def update_database():
         "per-page": 100
     }
 
-    cutoff_date = datetime.now() - timedelta(days=4)
+    cutoff_date = datetime.now() - timedelta(days=56)
 
     # 🔴 основная БД (запись)
     conn = sqlite3.connect("reservations.db", timeout=10)
@@ -288,13 +290,35 @@ async def add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         log_user(update)
 
+        # ✅ маскируем номер
+        masked_phone = mask_phone(phone)
+
+        user = update.effective_user
+        text_to_admin = (
+            f"📅 Новая бронь!\n\n"
+            f"👤 Telegram: {user.full_name}\n"
+            f"🆔 ID: {user.id}\n"
+            f"📱 Телефон: {masked_phone}\n"
+            f"🏷 На кого: {company}\n"
+            f"🕒 Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        # 🔥 отправка в админ-чат
+        await context.bot.send_message(
+            chat_id=-5239727089,
+            text=text_to_admin
+        )
+
         await update.message.reply_text(
             "✅ Бронь сохранена!",
             reply_markup=keyboard
         )
 
+    except Exception as e:
+        print("Ошибка в add_company:", e)
+        await update.message.reply_text("⚠️ Ошибка при сохранении")
+
     finally:
-        # 🔓 снимаем блок даже если произошла ошибка
         context.user_data["busy"] = False
 
     return ConversationHandler.END
