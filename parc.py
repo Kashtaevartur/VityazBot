@@ -114,7 +114,7 @@ def update_database():
         "per-page": 100
     }
 
-    cutoff_date = datetime.now() - timedelta(days=5)
+    cutoff_date = datetime.now() - timedelta(days=20)
 
     # 🔴 основная БД (запись)
     conn = sqlite3.connect("reservations.db", timeout=10)
